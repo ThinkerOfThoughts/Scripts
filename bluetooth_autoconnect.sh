@@ -15,22 +15,41 @@
 #bash path_to_script/bluetooth_autoconnect.sh
 #you have to use the full path for it to work, using the ~ shortcut doesn't work.
 
-#add the mac address of your device here, can befound with bt-device -l
+#add the mac addresses of your devices here, one per line, in quotes, the address of connected devices can befound with bt-device -l
 #note: for the above command you need bluez-tools (sudo apt install bluez-tools).
-device_address="PUT MAC ADDRESS HERE"
 
+declare -a device_address=(
+"PUT FIRST MAC ADDRESS HERE"
+"PUT FIRST MAC ADDRESS HERE"
+"PUT FIRST MAC ADDRESS HERE"
+);
 
-#checking if mac address is valid
-if bluetoothctl info "$device_address" | grep "Device $device_address not available" -q
+#checking that all MAC addresses are valid
+for i in "${device_address[@]}"
+do {
+    if bluetoothctl info "$i" | grep "Device $i not available" -q
     then {
         #if device is not detected, exit
         exit;
     } fi
+} done
 
-if bluetoothctl info "$device_address" | grep 'Connected: yes' -q; then
-    #if device is connected, disconnect
-  bluetoothctl disconnect "$device_address"
-else
-    #if device is not connected, connect
-  bluetoothctl connect "$device_address"
-fi
+
+#checking for and connecting to first available device
+for i in "${device_address[@]}"
+do {
+  if bluetoothctl info "$i" | grep 'Connected: yes' -q;
+  then {
+      #if device is connected, disconnect
+    bluetoothctl disconnect "$i"
+    #job done, exiting
+    exit;
+  } else {
+      #if device is not connected, try to connect
+    if bluetoothctl connect "$i" | grep 'Connection successful' -q;
+    then {
+       #job done, exiting
+      exit;
+    } fi
+  } fi
+} done
