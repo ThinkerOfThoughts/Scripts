@@ -52,13 +52,37 @@
 #   Stall is checked every minute regardless of the ping cadence, so a 20-minute ping interval does not
 #   blind it.
 #
+# ---------------------------------------------------------------------------------------------------
+# EGG TIMER MODE (--eggtimer; added 2026-11-10)
+#
+#   --eggtimer             Periodic wake-up timer that doubles as the usage watchdog, for an overnight run.
+#   --tick-sec <N>         Tick length in SECONDS (integer >= 1). Default: EGG_TICK_MIN minutes (25). For tests.
+#
+#   Launch:  WATCHDOG_MARKER=<path> usage_watchdog.sh --eggtimer --no-beep   (as a background task)
+#   WATCHDOG_MARKER MUST be set in this mode (exit 2 otherwise): the marker is deleted at launch, and the
+#   shared default marker must never be deleted by accident. Its directory is created if missing, and an
+#   unwritable path exits 2 at launch, so a usage reset can never be mistaken for a plain tick.
+#
+#   1. Deletes $WATCHDOG_MARKER at launch.
+#   2. Sleeps one tick (default 25 minutes) BEFORE its first ping.
+#   3. A reply with no failure since launch -> exit 0, NO marker (a plain tick; the launcher wakes).
+#   4. A failed ping -> the normal failure cadence (5 min; 20 min after 4 fails), as above.
+#   5. The first reply after a failure -> writes the marker and exits 0 (a usage reset).
+#   Stall watching (--stall-watch) and --max-min are ignored in this mode, so exit 1 never occurs.
+#   The ping's own environment carries OVERNIGHT_EGGTIMER_PING=1 (hooks use it to start the ping fast).
+#   Sleep slices are the smaller of 60 s and the tick.
+#
 # Env overrides: WATCHDOG_CLAUDE, WATCHDOG_MODEL, WATCHDOG_MARKER, WATCHDOG_PING_TIMEOUT,
 #                WATCHDOG_NORMAL_S, WATCHDOG_TIGHT_S.
-# Exit codes: 0 = usage recovery detected, or --max-min elapsed.  1 = STALL detected.  3 = no claude binary.
+# Exit codes: 0 = usage recovery detected, or --max-min elapsed, or (--eggtimer) a tick answered.  1 = STALL detected.  3 = no claude binary.
 #             2 = usage error.
 set -u
 
 STALL_PATHS=()
+EGGTIMER=0
+TICK_SEC=""
+# Owner (2026-11-10): "it'd fire every 25min" -- the egg timer's tick, in minutes.
+EGG_TICK_MIN=25
 STALL_MIN=25
 MAX_MIN=0
 BEEP=1
@@ -69,7 +93,13 @@ while [ $# -gt 0 ]; do
     --stall-min)   STALL_MIN="$2";      shift 2 ;;
     --max-min)     MAX_MIN="$2";        shift 2 ;;
     --no-beep)     BEEP=0;              shift ;;
-    -h|--help)     sed -n '1,60p' "$0"; exit 0 ;;
+    --eggtimer)    EGGTIMER=1;          shift ;;
+    --tick-sec)
+      if [ $# -lt 2 ] || ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+        echo "[watchdog] --tick-sec needs an integer >= 1 (seconds)" >&2; exit 2
+      fi
+      TICK_SEC="$2"; shift 2 ;;
+    -h|--help)     sed -n '1,/^[^#]/{/^[^#]/d;p}' "$0"; exit 0 ;;
     *) echo "[watchdog] unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -94,6 +124,22 @@ if [ -z "${CLAUDE:-}" ] || [ ! -x "$CLAUDE" ]; then
   exit 3
 fi
 
+SLICE=60   # sleep slice (seconds)
+if [ "$EGGTIMER" -eq 1 ]; then
+  if [ -z "${WATCHDOG_MARKER:-}" ]; then
+    echo "[watchdog] --eggtimer requires WATCHDOG_MARKER to be set" >&2; exit 2
+  fi
+  STALL_PATHS=(); MAX_MIN=0   # the one place stall watching and --max-min are turned off in this mode
+  TICK="${TICK_SEC:-$((EGG_TICK_MIN * 60))}"
+  [ "$TICK" -lt 60 ] && SLICE="$TICK"
+  mkdir -p "$(dirname "$MARKER")" 2>/dev/null
+  if ! { : > "$MARKER"; } 2>/dev/null; then
+    echo "[watchdog] cannot write marker $MARKER" >&2; exit 2
+  fi
+  rm -f "$MARKER"
+  export OVERNIGHT_EGGTIMER_PING=1
+fi
+
 ping_haiku() {   # 0 = pong, non-zero = failure (usage limit / error / timeout)
   local out rc
   out="$(timeout "$PING_TIMEOUT" "$CLAUDE" -p --model "$MODEL" "reply with exactly: pong" 2>/dev/null)"
@@ -114,6 +160,14 @@ tight_fails=0    # consecutive failures since we tightened
 log() { echo "[watchdog $(date -u +%H:%M:%SZ)] $*"; }
 
 start=$(date +%s)
+if [ "$EGGTIMER" -eq 1 ]; then
+  log "EGG TIMER — first ping after ${TICK}s; marker $MARKER (deleted); exits 0 on the first reply"
+  slept=0
+  while [ "$slept" -lt "$TICK" ]; do
+    step=$((TICK - slept)); [ "$step" -gt "$SLICE" ] && step="$SLICE"
+    sleep "$step"; slept=$((slept + step))
+  done
+fi
 if [ "${#STALL_PATHS[@]}" -gt 0 ]; then
   log "stall watching enabled — ${#STALL_PATHS[@]} path(s), idle threshold ${STALL_MIN}min, checked every 60s"
 fi
@@ -124,6 +178,10 @@ while true; do
     if [ "$waiting" -eq 1 ]; then
       printf '%s recovered\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MARKER"
       log "PONG after failure → USAGE RECOVERED. Taking you up."
+      exit 0
+    fi
+    if [ "$EGGTIMER" -eq 1 ]; then
+      log "pong, no failure since launch → tick answered. Exiting 0 (no marker)."
       exit 0
     fi
     log "pong (baseline ok)"
@@ -146,7 +204,7 @@ while true; do
   # Sleep out the ping cadence in 60s slices, checking for a stall each slice.
   slept=0
   while [ "$slept" -lt "$cadence" ]; do
-    sleep 60; slept=$((slept + 60))
+    sleep "$SLICE"; slept=$((slept + SLICE))
     now=$(date +%s)
 
     if [ "$MAX_MIN" -gt 0 ] && [ $(( (now - start) / 60 )) -ge "$MAX_MIN" ]; then
